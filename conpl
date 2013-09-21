@@ -1,0 +1,251 @@
+#!/usr/bin/env python
+"""Create, play, pause and resume arbitrarily long audio playlists.
+
+Uses mplayer for playback. Tested on Linux and OS X.
+"""
+
+import curses
+import json
+from glob import glob
+from itertools import *
+import os
+from os import path
+import re
+from select import select
+from subprocess import Popen, PIPE
+import sys
+from time import sleep
+import termios
+
+#-------------------------------------------------------------------------------
+
+CONF_DIR = path.expanduser('~/.conpl')
+PTRN = re.compile('\.(mp3|m4a)$', re.I)
+
+#-------------------------------------------------------------------------------
+
+class ConPl(object):
+    def __init__(self, abspath=None, filename=None, files=None, index=None,
+                 position=None, volume=None):
+        self.abspath = abspath
+        self.filename = filename
+
+        if files:
+            self.files = files
+        else:
+            self.files = [fn for t in os.walk(self.abspath)
+                          for fn in t[2] if PTRN.search(fn)]
+        self.files.sort()
+        self.index = 0 if index is None else index
+        self.position = '0' if position is None else position
+
+        self.volume = str(int(float(volume))) if volume else '5'
+
+        self.actions = {
+            '\n'             : lambda: bool(self.stop()) ^ True,
+            ' '              : lambda: self._command('pause'),
+
+            curses.KEY_UP    : lambda: self.seek('60'),
+            curses.KEY_DOWN  : lambda: self.seek('-60'),
+
+            curses.KEY_RIGHT : lambda: self.seek('10'),
+            ']'              : lambda: self.seek('20'),
+            '['              : lambda: self.seek('-20'),
+            curses.KEY_LEFT  : lambda: self.seek('-10'),
+
+            '*'              : lambda: self.setvol('+1'),
+            '/'              : lambda: self.setvol('-1'),
+
+            'd'              : self.render_volbar,
+            'r'              : self.restart,
+        }
+
+    @classmethod
+    def from_json(cls, fn):
+        d = json.load(open(fn))
+        d = dict((str(k), v) for k, v in d.iteritems())
+        return cls(**d)
+
+    def stop(self):
+        self.position = self.pos
+        self._command('quit')
+        s = str(self)
+        with open(path.join(CONF_DIR, self.filename), 'w') as f:
+            f.write(s)
+        if self.player.poll() is None:
+            sleep(0.01)
+        self.win.erase()
+        self.win.refresh()
+
+    @property
+    def pos(self):
+        output = self._command('get_time_pos', True)
+        if output == 'Exiting... (End of file)':
+            raise IOError()
+        return output.split('=')[1]
+
+    @property
+    def vol(self):
+        while True:
+            output = self._command('get_property volume', True)
+            try:
+                return output.split('\n')[-1].split('=')[1]
+            except:
+                pass
+
+    ############################################################################
+    # Mplayer interaction
+    #
+    def _command(self, command, output=False):
+        #self.log(command)
+        self.player.stdin.write('pausing_keep ' + command + '\n')
+        self.render_volbar(False)
+        if output:
+            return self._readlines()
+
+    def _readlines(self, timeout=0.1):
+        line = ''
+        while not line:
+            while any(select([self.player.stdout], [], [], timeout)):
+                newline = self.player.stdout.readline()
+                if not newline and line: break
+                line = newline
+        return line.strip()
+
+    def _start(self):
+        comm = ['mplayer', '-slave', '-quiet', self.current_path,
+                '-ss', self.position]
+        ftype = PTRN.search(self.files[0]).group(1)
+        if ftype.lower() == 'mp3':
+            comm.extend(['-ac', 'ffmp3'])
+        self.player = Popen(comm, stdin=PIPE, stdout=PIPE, stderr=PIPE)
+        #self.log(repr(comm))
+        if self.vol != self.volume:
+            self.setvol(self.volume + ' 1')
+    ############################################################################
+
+    @property
+    def current_path(self):
+        return path.join(self.abspath, self.files[self.index])
+
+    def __str__(self):
+        d = dict(self.__dict__)
+        d.pop('player', None)
+        d.pop('old_settings', None)
+        d.pop('win', None)
+        d.pop('actions', None)
+        d.pop('linelength', None)
+        return json.dumps(d, indent=2, sort_keys=True)
+
+    def debug(self):
+        termios.tcsetattr(sys.stdin, termios.TCSADRAIN, self.old_settings)
+        import pdb; pdb.set_trace()
+
+    def handle_char(self, c):
+        if c == -1: return
+        c = chr(c) if c < 256 else c
+        return self.actions.get(c, lambda: None)()
+
+    @property
+    def track_length(self):
+        output = self._command('get_time_length', True)
+        return float(output.split('=')[1])
+
+    def seek(self, s):
+        self.position = self.pos
+        if float(self.position) < 1 and int(s) < 0:
+            self.prev()
+            s = '%s 2' % (self.track_length + int(s))
+        self._command('seek %s' % s)
+        try:
+            self.position = self.pos
+        except IOError:
+            # We seeked past the current track length.
+            self.advance()
+            self._start()
+        except Exception, e:
+            # MPlayer became unresponsive. Seems to happen when using ffmp3.
+            self.restart()
+            self.seek(s)
+
+    def restart(self):
+        self._command('quit')
+        self.player.kill()
+        del self.player
+        self._start()
+
+    def render_volbar(self, update=True):
+        bars = int(float(self.vol)) if update else int(float(self.volume))
+        l = (
+            '|' * bars,
+            ' ' * (100 - bars),
+        )
+        self.win.addstr(1, 0, ('%%%ds' % -self.linelength) % self.current_path[-self.linelength:])
+        self.win.addstr(0, 0, ''.join(l))
+        self.win.refresh()
+
+    def log(self, s):
+        self.win.addstr(2, 0, s)
+        self.win.refresh()
+
+    def advance(self):
+        self.index += 1
+        self.position = '0'
+
+    def setvol(self, s):
+        vol = int(float(self.vol))
+        try:
+            delta = int(s)
+        except ValueError:
+            delta = 0
+        if vol <= 3 and int(delta) < 0:
+            if vol == 0: return
+            s = '0 2'
+        elif vol >= 97 and int(delta) > 0:
+            if vol == 100: return
+            s = '100 2'
+        self._command('volume %s' % s, True)
+        self.volume = self.vol
+        self.render_volbar()
+
+    def prev(self):
+        self.index -= 1
+        self.position = '0'
+        self.restart()
+
+    def mainloop(self, stdscr):
+        curses.use_default_colors()
+        stdscr.nodelay(True)
+        self.win = stdscr
+        self.linelength = self.win.getmaxyx()[1] - 1
+        while self.index <= len(self.files):
+            self._start()
+            while self.player.poll() is None:
+                if self.handle_char(stdscr.getch()): return
+                sleep(0.1)
+            self.advance()
+
+
+if __name__ == '__main__':
+    bcpl = path.basename(sys.argv[1])
+    cpl = path.join(CONF_DIR, bcpl)
+    pth = sys.argv[2] if len(sys.argv) > 2 else None
+
+    if pth and not path.isfile(cpl):
+        if len(sys.argv) > 3:
+            conpl = ConPl(pth, cpl, files=list(l.rstrip('\n') for l in open(sys.argv[3])))
+        else:
+            conpl = ConPl(pth, cpl)
+    else:
+        conpl = ConPl.from_json(cpl)
+
+    conpl.old_settings = termios.tcgetattr(sys.stdin)
+    #curses.filter()
+    curses.wrapper(conpl.mainloop)
+
+
+################################################################################
+# Notes
+#
+# _1_: Asking for the output there, otherwise an immediate pos call this line
+# would get the volume feedback, and return that as the result of pos.
